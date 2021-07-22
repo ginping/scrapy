@@ -15,8 +15,13 @@ from twisted.python.failure import Failure
 
 from scrapy import signals
 from scrapy.core.scraper import Scraper
-from scrapy.exceptions import DontCloseSpider, ScrapyDeprecationWarning
+from scrapy.exceptions import (
+    CloseSpider,
+    DontCloseSpider,
+    ScrapyDeprecationWarning,
+)
 from scrapy.http import Response, Request
+from scrapy.settings import BaseSettings
 from scrapy.spiders import Spider
 from scrapy.utils.log import logformatter_adapter, failure_to_exc_info
 from scrapy.utils.misc import create_instance, load_object
@@ -73,11 +78,21 @@ class ExecutionEngine:
         self.spider: Optional[Spider] = None
         self.running = False
         self.paused = False
-        self.scheduler_cls = load_object(crawler.settings["SCHEDULER"])
+        self.scheduler_cls = self._get_scheduler_class(crawler.settings)
         downloader_cls = load_object(self.settings['DOWNLOADER'])
         self.downloader = downloader_cls(crawler)
         self.scraper = Scraper(crawler)
         self._spider_closed_callback = spider_closed_callback
+
+    def _get_scheduler_class(self, settings: BaseSettings) -> type:
+        from scrapy.core.scheduler import BaseScheduler
+        scheduler_cls = load_object(settings["SCHEDULER"])
+        if not issubclass(scheduler_cls, BaseScheduler):
+            raise TypeError(
+                f"The provided scheduler class ({settings['SCHEDULER']})"
+                " does not fully implement the scheduler interface"
+            )
+        return scheduler_cls
 
     @inlineCallbacks
     def start(self) -> Deferred:
@@ -161,7 +176,7 @@ class ExecutionEngine:
             return None
 
         d = self._download(request, self.spider)
-        d.addBoth(self._handle_downloader_output, request, self.spider)
+        d.addBoth(self._handle_downloader_output, request)
         d.addErrback(lambda f: logger.info('Error while handling downloader output',
                                            exc_info=failure_to_exc_info(f),
                                            extra={'spider': self.spider}))
@@ -176,8 +191,10 @@ class ExecutionEngine:
         return d
 
     def _handle_downloader_output(
-        self, result: Union[Request, Response, Failure], request: Request, spider: Spider
+        self, result: Union[Request, Response, Failure], request: Request
     ) -> Optional[Deferred]:
+        assert self.spider is not None  # typing
+
         if not isinstance(result, (Request, Response, Failure)):
             raise TypeError(f"Incorrect type: expected Request, Response or Failure, got {type(result)}: {result!r}")
 
@@ -186,12 +203,12 @@ class ExecutionEngine:
             self.crawl(result)
             return None
 
-        d = self.scraper.enqueue_scrape(result, request, spider)
+        d = self.scraper.enqueue_scrape(result, request, self.spider)
         d.addErrback(
             lambda f: logger.error(
                 "Error while enqueuing downloader output",
                 exc_info=failure_to_exc_info(f),
-                extra={'spider': spider},
+                extra={'spider': self.spider},
             )
         )
         return d
@@ -299,7 +316,8 @@ class ExecutionEngine:
         start_requests = yield self.scraper.spidermw.process_start_requests(start_requests, spider)
         self.slot = Slot(start_requests, close_if_idle, nextcall, scheduler)
         self.spider = spider
-        yield scheduler.open(spider)
+        if hasattr(scheduler, "open"):
+            yield scheduler.open(spider)
         yield self.scraper.open_spider(spider)
         self.crawler.stats.open_spider(spider)
         yield self.signals.send_catch_log_deferred(signals.spider_opened, spider=spider)
@@ -311,14 +329,23 @@ class ExecutionEngine:
         Called when a spider gets idle, i.e. when there are no remaining requests to download or schedule.
         It can be called multiple times. If a handler for the spider_idle signal raises a DontCloseSpider
         exception, the spider is not closed until the next loop and this function is guaranteed to be called
-        (at least) once again.
+        (at least) once again. A handler can raise CloseSpider to provide a custom closing reason.
         """
         assert self.spider is not None  # typing
-        res = self.signals.send_catch_log(signals.spider_idle, spider=self.spider, dont_log=DontCloseSpider)
-        if any(isinstance(x, Failure) and isinstance(x.value, DontCloseSpider) for _, x in res):
+        expected_ex = (DontCloseSpider, CloseSpider)
+        res = self.signals.send_catch_log(signals.spider_idle, spider=self.spider, dont_log=expected_ex)
+        detected_ex = {
+            ex: x.value
+            for _, x in res
+            for ex in expected_ex
+            if isinstance(x, Failure) and isinstance(x.value, ex)
+        }
+        if DontCloseSpider in detected_ex:
             return None
         if self.spider_is_idle():
-            self.close_spider(self.spider, reason='finished')
+            ex = detected_ex.get(CloseSpider, CloseSpider(reason='finished'))
+            assert isinstance(ex, CloseSpider)  # typing
+            self.close_spider(self.spider, reason=ex.reason)
 
     def close_spider(self, spider: Spider, reason: str = "cancelled") -> Deferred:
         """Close (cancel) spider and clear all its outstanding requests"""
@@ -343,8 +370,9 @@ class ExecutionEngine:
         dfd.addBoth(lambda _: self.scraper.close_spider(spider))
         dfd.addErrback(log_failure('Scraper close failure'))
 
-        dfd.addBoth(lambda _: self.slot.scheduler.close(reason))
-        dfd.addErrback(log_failure('Scheduler close failure'))
+        if hasattr(self.slot.scheduler, "close"):
+            dfd.addBoth(lambda _: self.slot.scheduler.close(reason))
+            dfd.addErrback(log_failure("Scheduler close failure"))
 
         dfd.addBoth(lambda _: self.signals.send_catch_log_deferred(
             signal=signals.spider_closed, spider=spider, reason=reason,
